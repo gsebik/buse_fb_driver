@@ -1,2 +1,2 @@
-# -buse_fb_driver
+# buse_fb_driver
 Framebuffer sriver for BUSE displays
