@@ -1,0 +1,24 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2835";
+
+    fragment@0 {
+        target = <&spi0>;
+        __overlay__ {
+            status = "okay";
+
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            busefb: busefb@0 {
+                compatible = "buse,buse128x19";
+                reg = <0>;  // Unit address matches "busefb@0"
+                spi-max-frequency = <3000000>;
+                // cs-gpios removed for overlay compatibility
+            };
+        };
+    };
+};
+
