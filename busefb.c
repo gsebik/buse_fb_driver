@@ -9,7 +9,7 @@
  * Uses native SPI CE0 inverted (active-high) via SPI_CS_HIGH.
  *
  * Build:
- *   obj-m += busefb_fb_driver.o
+ *   obj-m += busefb.o
  */
 
 #include <linux/module.h>
