@@ -1,2 +1,21 @@
 # buse_fb_driver
 Framebuffer sriver for BUSE displays
+
+
+## Compile DT overlay
+```bash
+dtc -@ -I dts -O dtb -o busefb.dtbo busefb-overlay.dts
+
+sudo cp busefb.dtbo /boot/overlays/ 
+```
+## Build kernel module and install
+```bash
+make
+
+sudo cp busefb.ko /lib/modules/$(uname -r)/kernel/drivers/misc/
+
+sudo depmod -a
+
+```
+
+
