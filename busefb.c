@@ -1,8 +1,3 @@
-/*
- * busefb_fb_driver.c
- * SPI framebuffer driver with hrtimer-based scheduling and manual GPIO CS control.
- */
-
 #include <linux/module.h>
 #include <linux/spi/spi.h>
 #include <linux/fb.h>
@@ -13,6 +8,7 @@
 #include <linux/vmalloc.h>
 #include <linux/hrtimer.h>
 #include <linux/ktime.h>
+#include <linux/spinlock.h>
 
 #define WIDTH               128
 #define HEIGHT               19
@@ -26,29 +22,86 @@
 #define GROUP_BYTES        (PANELS * PANEL_BYTES)
 #define FRAME_BYTES         (GROUPS * GROUP_BYTES)
 
-#define REFRESH_INTERVAL_NS (1000000000 / 120)
-
+#define REFRESH_INTERVAL_NS (1000000000 / 30)
 
 struct busefb_par {
     struct spi_device *spi;
     struct fb_info *info;
     struct workqueue_struct *wq;
     struct work_struct refresh_work;
+    struct work_struct cs_reassert_work;
     struct gpio_desc *cs_gpio;
     struct hrtimer refresh_timer;
+    struct hrtimer cs_delay_timer;
+    spinlock_t fb_lock;
+
+    u8 frame_buffer[FRAME_BYTES];
+    int current_group;
 };
 
-static struct busefb_par *global_par;
+static void process_next_group(struct busefb_par *par);
+
+/* CS GPIO reassertion via workqueue */
+static void cs_reassert_work_func(struct work_struct *work)
+{
+    struct busefb_par *par = container_of(work, struct busefb_par, cs_reassert_work);
+
+    gpiod_set_value(par->cs_gpio, 1);  // Re-assert CS
+
+    par->current_group++;
+    process_next_group(par);
+}
+
+/* CS delay timer callback */
+static enum hrtimer_restart cs_delay_timer_callback(struct hrtimer *timer)
+{
+    struct busefb_par *par = container_of(timer, struct busefb_par, cs_delay_timer);
+
+    /* Schedule GPIO toggle in workqueue */
+    queue_work(par->wq, &par->cs_reassert_work);
+
+    return HRTIMER_NORESTART;
+}
+
+static void process_next_group(struct busefb_par *par)
+{
+    if (par->current_group >= GROUPS) {
+        par->current_group = 0;
+        return;
+    }
+
+    int g = par->current_group;
+
+    gpiod_set_value(par->cs_gpio, 1);
+
+    struct spi_transfer t = {
+        .tx_buf    = par->frame_buffer + g * GROUP_BYTES,
+        .len       = GROUP_BYTES,
+        .speed_hz  = par->spi->max_speed_hz,
+    };
+
+    struct spi_message m;
+    spi_message_init(&m);
+    spi_message_add_tail(&t, &m);
+    spi_sync(par->spi, &m);
+
+    gpiod_set_value(par->cs_gpio, 0);
+
+    hrtimer_start(&par->cs_delay_timer, ktime_set(0, 50 * 1000), HRTIMER_MODE_REL_PINNED);
+}
 
 static void refresh_work_func(struct work_struct *work)
 {
-    struct busefb_par *par = global_par;
-    u8 frame[FRAME_BYTES] = {0};
+    struct busefb_par *par = container_of(work, struct busefb_par, refresh_work);
     u8 *vram = par->info->screen_base;
+
+    spin_lock(&par->fb_lock);
+    memset(par->frame_buffer, 0, FRAME_BYTES);
 
     for (int y = 0; y < HEIGHT; y++) {
         for (int x = 0; x < WIDTH; x++) {
-            int idx = y * WIDTH + x;
+            int x_mirrored = WIDTH - 1 - x;
+            int idx = y * WIDTH + x_mirrored;
             if (!(vram[idx >> 3] & (1 << (idx & 7))))
                 continue;
 
@@ -59,30 +112,14 @@ static void refresh_work_func(struct work_struct *work)
             int grp = x % GROUPS;
             int cp = (x % PANEL_COLS) / GROUPS ^ 0x01;
             int base = grp * GROUP_BYTES + panel * PANEL_BYTES;
-            frame[base] = grp;
-            frame[base + 1 + cp * REGS_PER_COL + reg] |= 1 << bit;
+            par->frame_buffer[base] = grp;
+            par->frame_buffer[base + 1 + cp * REGS_PER_COL + reg] |= 1 << bit;
         }
     }
+    spin_unlock(&par->fb_lock);
 
-    for (int g = 0; g < GROUPS; g++) {
-        gpiod_set_value_cansleep(par->cs_gpio, 1);
-
-        struct spi_transfer t = {
-            .tx_buf    = frame + g * GROUP_BYTES,
-            .len       = GROUP_BYTES,
-            .speed_hz  = par->spi->max_speed_hz,
-        };
-
-        struct spi_message m;
-        spi_message_init(&m);
-        spi_message_add_tail(&t, &m);
-        spi_sync(par->spi, &m);
-
-        gpiod_set_value_cansleep(par->cs_gpio, 0);
-        udelay(50);
-        gpiod_set_value_cansleep(par->cs_gpio, 1);
-	udelay(5);
-    }
+    par->current_group = 0;
+    process_next_group(par);
 }
 
 static enum hrtimer_restart refresh_timer_callback(struct hrtimer *timer)
@@ -121,7 +158,7 @@ static int busefb_probe(struct spi_device *spi)
         return PTR_ERR(par->cs_gpio);
 
     par->spi = spi;
-    global_par = par;
+    spin_lock_init(&par->fb_lock);
 
     info = framebuffer_alloc(0, &spi->dev);
     if (!info)
@@ -151,9 +188,14 @@ static int busefb_probe(struct spi_device *spi)
     }
 
     INIT_WORK(&par->refresh_work, refresh_work_func);
-    hrtimer_init(&par->refresh_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+    INIT_WORK(&par->cs_reassert_work, cs_reassert_work_func);
+
+    hrtimer_init(&par->refresh_timer, CLOCK_MONOTONIC, HRTIMER_MODE_PINNED | HRTIMER_MODE_HARD);
     par->refresh_timer.function = refresh_timer_callback;
-    hrtimer_start(&par->refresh_timer, ns_to_ktime(REFRESH_INTERVAL_NS), HRTIMER_MODE_REL);
+    hrtimer_start(&par->refresh_timer, ns_to_ktime(REFRESH_INTERVAL_NS), HRTIMER_MODE_PINNED | HRTIMER_MODE_HARD);
+
+    hrtimer_init(&par->cs_delay_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
+    par->cs_delay_timer.function = cs_delay_timer_callback;
 
     ret = register_framebuffer(info);
     if (ret < 0)
@@ -161,6 +203,10 @@ static int busefb_probe(struct spi_device *spi)
 
     spi_set_drvdata(spi, par);
     dev_info(&spi->dev, "busefb registered as /dev/fb%d\n", info->node);
+
+    if (gpiod_cansleep(par->cs_gpio))
+        dev_warn(&spi->dev, "GPIO cannot be toggled in atomic context, timing may vary\n");
+
     return 0;
 
 err_wq:
@@ -176,6 +222,7 @@ static void busefb_remove(struct spi_device *spi)
 {
     struct busefb_par *par = spi_get_drvdata(spi);
     hrtimer_cancel(&par->refresh_timer);
+    hrtimer_cancel(&par->cs_delay_timer);
     unregister_framebuffer(par->info);
     destroy_workqueue(par->wq);
     vfree(par->info->screen_base);
@@ -199,6 +246,6 @@ static struct spi_driver busefb_driver = {
 module_spi_driver(busefb_driver);
 
 MODULE_AUTHOR("You");
-MODULE_DESCRIPTION("Buse 128×19 SPI framebuffer driver with hrtimer-based scheduling and GPIO CS control");
+MODULE_DESCRIPTION("Buse 128×19 SPI framebuffer driver with hrtimer-based scheduling and direct GPIO CS control");
 MODULE_LICENSE("GPL");
 
