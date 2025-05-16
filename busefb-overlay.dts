@@ -16,10 +16,7 @@
                 compatible = "buse,buse128x19";
                 reg = <0>;  // Unit address matches "busefb@0"
                 spi-max-frequency = <3000000>;
-		//spi-cs-high;
-		//cs-gpios = <&gpio 8 0>;
 		cs-gpios = <&gpio 17 0>;
-                // cs-gpios removed for overlay compatibility
             };
         };
     };
