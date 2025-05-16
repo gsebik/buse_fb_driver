@@ -22,7 +22,6 @@
 #define GROUP_BYTES        (PANELS * PANEL_BYTES)
 #define FRAME_BYTES         (GROUPS * GROUP_BYTES)
 
-#define REFRESH_INTERVAL_NS (1000000000 / 240)
 #define DISPLAY_BRIGHTNESS_USEC 50
 
 struct busefb_par {
@@ -32,7 +31,6 @@ struct busefb_par {
     struct work_struct refresh_work;
     struct work_struct cs_reassert_work;
     struct gpio_desc *cs_gpio;
-    struct hrtimer refresh_timer;
     struct hrtimer cs_delay_timer;
     spinlock_t fb_lock;
 
@@ -48,7 +46,13 @@ static void cs_reassert_work_func(struct work_struct *work)
     struct busefb_par *par = container_of(work, struct busefb_par, cs_reassert_work);
     gpiod_set_value(par->cs_gpio, 1);
     par->current_group++;
-    process_next_group(par);
+
+    if (par->current_group >= GROUPS) {
+        par->current_group = 0;
+        queue_work(par->wq, &par->refresh_work);  // Start new frame immediately
+    } else {
+        process_next_group(par);  // Continue to next group
+    }
 }
 
 static enum hrtimer_restart cs_delay_timer_callback(struct hrtimer *timer)
@@ -60,11 +64,6 @@ static enum hrtimer_restart cs_delay_timer_callback(struct hrtimer *timer)
 
 static void process_next_group(struct busefb_par *par)
 {
-    if (par->current_group >= GROUPS) {
-        par->current_group = 0;
-        return;
-    }
-
     int g = par->current_group;
     gpiod_set_value(par->cs_gpio, 1);
 
@@ -117,14 +116,6 @@ static void refresh_work_func(struct work_struct *work)
 
     par->current_group = 0;
     process_next_group(par);
-}
-
-static enum hrtimer_restart refresh_timer_callback(struct hrtimer *timer)
-{
-    struct busefb_par *par = container_of(timer, struct busefb_par, refresh_timer);
-    queue_work(par->wq, &par->refresh_work);
-    hrtimer_forward_now(timer, ns_to_ktime(REFRESH_INTERVAL_NS));
-    return HRTIMER_RESTART;
 }
 
 static const struct fb_ops busefb_fbops = {
@@ -193,12 +184,8 @@ static int busefb_probe(struct spi_device *spi)
     INIT_WORK(&par->refresh_work, refresh_work_func);
     INIT_WORK(&par->cs_reassert_work, cs_reassert_work_func);
 
-    hrtimer_init(&par->refresh_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL | HRTIMER_MODE_HARD );
-    par->refresh_timer.function = refresh_timer_callback;
-    hrtimer_start(&par->refresh_timer, ns_to_ktime(REFRESH_INTERVAL_NS),
-                  HRTIMER_MODE_PINNED | HRTIMER_MODE_HARD);
-
-    hrtimer_init(&par->cs_delay_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL | HRTIMER_MODE_HARD);
+    //hrtimer_init(&par->cs_delay_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL | HRTIMER_MODE_HARD);
+    hrtimer_init(&par->cs_delay_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL );
     par->cs_delay_timer.function = cs_delay_timer_callback;
 
     ret = register_framebuffer(info);
@@ -210,6 +197,8 @@ static int busefb_probe(struct spi_device *spi)
 
     if (gpiod_cansleep(par->cs_gpio))
         dev_warn(&spi->dev, "GPIO cannot be toggled in atomic context, timing may vary\n");
+
+    queue_work(par->wq, &par->refresh_work);  // Kick-off first frame build
 
     return 0;
 
@@ -227,7 +216,6 @@ err_fb:
 static void busefb_remove(struct spi_device *spi)
 {
     struct busefb_par *par = spi_get_drvdata(spi);
-    hrtimer_cancel(&par->refresh_timer);
     hrtimer_cancel(&par->cs_delay_timer);
     unregister_framebuffer(par->info);
     destroy_workqueue(par->wq);
@@ -253,6 +241,6 @@ static struct spi_driver busefb_driver = {
 module_spi_driver(busefb_driver);
 
 MODULE_AUTHOR("You");
-MODULE_DESCRIPTION("Buse 128×19 SPI framebuffer driver with safe double-buffering and hrtimer scheduling");
+MODULE_DESCRIPTION("Buse 128×19 SPI framebuffer driver with continuous update loop");
 MODULE_LICENSE("GPL");
 
