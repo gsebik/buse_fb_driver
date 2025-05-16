@@ -22,7 +22,8 @@
 #define GROUP_BYTES        (PANELS * PANEL_BYTES)
 #define FRAME_BYTES         (GROUPS * GROUP_BYTES)
 
-#define REFRESH_INTERVAL_NS (1000000000 / 30)
+#define REFRESH_INTERVAL_NS (1000000000 / 240)
+#define DISPLAY_BRIGHTNESS_USEC 50
 
 struct busefb_par {
     struct spi_device *spi;
@@ -36,30 +37,24 @@ struct busefb_par {
     spinlock_t fb_lock;
 
     u8 frame_buffer[FRAME_BYTES];
+    u8 *shadow_vram;
     int current_group;
 };
 
 static void process_next_group(struct busefb_par *par);
 
-/* CS GPIO reassertion via workqueue */
 static void cs_reassert_work_func(struct work_struct *work)
 {
     struct busefb_par *par = container_of(work, struct busefb_par, cs_reassert_work);
-
-    gpiod_set_value(par->cs_gpio, 1);  // Re-assert CS
-
+    gpiod_set_value(par->cs_gpio, 1);
     par->current_group++;
     process_next_group(par);
 }
 
-/* CS delay timer callback */
 static enum hrtimer_restart cs_delay_timer_callback(struct hrtimer *timer)
 {
     struct busefb_par *par = container_of(timer, struct busefb_par, cs_delay_timer);
-
-    /* Schedule GPIO toggle in workqueue */
     queue_work(par->wq, &par->cs_reassert_work);
-
     return HRTIMER_NORESTART;
 }
 
@@ -71,7 +66,6 @@ static void process_next_group(struct busefb_par *par)
     }
 
     int g = par->current_group;
-
     gpiod_set_value(par->cs_gpio, 1);
 
     struct spi_transfer t = {
@@ -87,22 +81,26 @@ static void process_next_group(struct busefb_par *par)
 
     gpiod_set_value(par->cs_gpio, 0);
 
-    hrtimer_start(&par->cs_delay_timer, ktime_set(0, 50 * 1000), HRTIMER_MODE_REL_PINNED);
+    hrtimer_start(&par->cs_delay_timer,
+                  ktime_set(0, DISPLAY_BRIGHTNESS_USEC * 1000),
+                  HRTIMER_MODE_REL_PINNED);
 }
 
 static void refresh_work_func(struct work_struct *work)
 {
     struct busefb_par *par = container_of(work, struct busefb_par, refresh_work);
-    u8 *vram = par->info->screen_base;
+    u8 *vram_snapshot = par->shadow_vram;
 
     spin_lock(&par->fb_lock);
+    memcpy(vram_snapshot, par->info->screen_base, par->info->fix.smem_len);
     memset(par->frame_buffer, 0, FRAME_BYTES);
+    spin_unlock(&par->fb_lock);
 
     for (int y = 0; y < HEIGHT; y++) {
         for (int x = 0; x < WIDTH; x++) {
             int x_mirrored = WIDTH - 1 - x;
             int idx = y * WIDTH + x_mirrored;
-            if (!(vram[idx >> 3] & (1 << (idx & 7))))
+            if (!(vram_snapshot[idx >> 3] & (1 << (idx & 7))))
                 continue;
 
             int y_rev = HEIGHT - 1 - y;
@@ -116,7 +114,6 @@ static void refresh_work_func(struct work_struct *work)
             par->frame_buffer[base + 1 + cp * REGS_PER_COL + reg] |= 1 << bit;
         }
     }
-    spin_unlock(&par->fb_lock);
 
     par->current_group = 0;
     process_next_group(par);
@@ -181,20 +178,27 @@ static int busefb_probe(struct spi_device *spi)
         goto err_fb;
     }
 
+    par->shadow_vram = vzalloc(info->fix.smem_len);
+    if (!par->shadow_vram) {
+        ret = -ENOMEM;
+        goto err_vram;
+    }
+
     par->wq = create_singlethread_workqueue("busefb_wq");
     if (!par->wq) {
         ret = -ENOMEM;
-        goto err_vram;
+        goto err_shadow;
     }
 
     INIT_WORK(&par->refresh_work, refresh_work_func);
     INIT_WORK(&par->cs_reassert_work, cs_reassert_work_func);
 
-    hrtimer_init(&par->refresh_timer, CLOCK_MONOTONIC, HRTIMER_MODE_PINNED | HRTIMER_MODE_HARD);
+    hrtimer_init(&par->refresh_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL | HRTIMER_MODE_HARD );
     par->refresh_timer.function = refresh_timer_callback;
-    hrtimer_start(&par->refresh_timer, ns_to_ktime(REFRESH_INTERVAL_NS), HRTIMER_MODE_PINNED | HRTIMER_MODE_HARD);
+    hrtimer_start(&par->refresh_timer, ns_to_ktime(REFRESH_INTERVAL_NS),
+                  HRTIMER_MODE_PINNED | HRTIMER_MODE_HARD);
 
-    hrtimer_init(&par->cs_delay_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
+    hrtimer_init(&par->cs_delay_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL | HRTIMER_MODE_HARD);
     par->cs_delay_timer.function = cs_delay_timer_callback;
 
     ret = register_framebuffer(info);
@@ -211,6 +215,8 @@ static int busefb_probe(struct spi_device *spi)
 
 err_wq:
     destroy_workqueue(par->wq);
+err_shadow:
+    vfree(par->shadow_vram);
 err_vram:
     vfree(info->screen_base);
 err_fb:
@@ -225,6 +231,7 @@ static void busefb_remove(struct spi_device *spi)
     hrtimer_cancel(&par->cs_delay_timer);
     unregister_framebuffer(par->info);
     destroy_workqueue(par->wq);
+    vfree(par->shadow_vram);
     vfree(par->info->screen_base);
     framebuffer_release(par->info);
 }
@@ -246,6 +253,6 @@ static struct spi_driver busefb_driver = {
 module_spi_driver(busefb_driver);
 
 MODULE_AUTHOR("You");
-MODULE_DESCRIPTION("Buse 128×19 SPI framebuffer driver with hrtimer-based scheduling and direct GPIO CS control");
+MODULE_DESCRIPTION("Buse 128×19 SPI framebuffer driver with safe double-buffering and hrtimer scheduling");
 MODULE_LICENSE("GPL");
 
