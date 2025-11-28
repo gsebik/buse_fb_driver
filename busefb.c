@@ -120,6 +120,8 @@ static void refresh_work_func(struct work_struct *work)
 
 static const struct fb_ops busefb_ops = {
 	.owner = THIS_MODULE,
+	.fb_read      = fb_sys_read,
+    .fb_write     = fb_sys_write,
 	.fb_fillrect = cfb_fillrect,
 	.fb_copyarea = cfb_copyarea,
 	.fb_imageblit = cfb_imageblit,
