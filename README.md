@@ -27,6 +27,8 @@ panels = <4>;        // Number of display panels
 
 ## Build kernel module and install
 ```bash
+# if dont have headers install first
+sudo apt install linux-headers-$(uname -r)
 # build
 make
 # copy
